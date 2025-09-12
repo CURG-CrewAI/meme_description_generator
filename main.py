@@ -3,9 +3,12 @@ import os
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process, LLM
 from crewai_tools import SerperDevTool, ScrapeWebsiteTool
+from crewai.tools import tool
 from typing import Dict, Any
 import json
+import re
 from datetime import datetime
+import requests
 
 # 환경 변수 로드
 load_dotenv()
@@ -19,6 +22,48 @@ def _get_api_key():
 def _check_serper_key():
     if not os.getenv("SERPER_API_KEY"):
         raise RuntimeError("Set SERPER_API_KEY in your .env (required by SerperDevTool)")
+
+# Serper 이미지 검색 도구 (image_generator.py에서 가져옴)
+@tool("Serper Image Search")
+def serper_image_search(search_query: str) -> str:
+    """Serper API를 사용해 이미지 검색 수행 후 JSON 반환"""
+    api_key = os.getenv("SERPER_API_KEY")
+    if not api_key:
+        return json.dumps({"keyword": search_query, "image_url": "API key missing"})
+
+    url = "https://google.serper.dev/images"
+    payload = json.dumps({"q": search_query})
+    headers = {'X-API-KEY': api_key, 'Content-Type': 'application/json'}
+
+    try:
+        response = requests.post(url, headers=headers, data=payload)
+        response.raise_for_status()
+        results = response.json()
+        
+        images = results.get('images', [])
+        if images:
+            image_url = images[0].get('imageUrl') or images[0].get('link') or "No image found"
+            return json.dumps({"keyword": search_query, "image_url": image_url})
+        else:
+            return json.dumps({"keyword": search_query, "image_url": "No image found"})
+    except Exception as e:
+        return json.dumps({"keyword": search_query, "image_url": f"Search error: {str(e)}"})
+
+def extract_keywords_from_translation(translation_result):
+    """Translation 결과에서 Key Visual Keywords 추출 (image_generator.py에서 가져옴)"""
+    try:
+        pattern = r'\*\*Key Visual Keywords:\*\*\s*\[(.*?)\]'
+        match = re.search(pattern, translation_result)
+        
+        if match:
+            keywords_str = match.group(1)
+            keywords = [k.strip().strip('"').strip("'") for k in keywords_str.split(',')]
+            return [k for k in keywords if k][:3]
+        
+        return ["Korean Issue", "News", "Trending"]
+    except Exception as e:
+        print(f"키워드 추출 오류: {e}")
+        return ["Korean Issue", "News", "Trending"]
 
 class MemeAgentCrew:
     def __init__(self):
@@ -49,16 +94,26 @@ class MemeAgentCrew:
             llm=self.gemini_flash_lite
         )
        
-        # 뉴스 기사에서 본문을 추출하는 에이전트
+        # 뉴스 기사에서 본문을 추출하는 에이전트 (무한루프 방지 강화)
         self.extractor_agent = Agent(
-            role='News Content Extraction Expert',
-            goal='Extract and summarize core content from article URLs',
+            role='Korean News Content Extraction and Validation Expert',
+            goal='Extract, validate, and filter Korean news content while preventing infinite loops and repetitive content',
             backstory=(
-                """You are an expert at extracting key information from web pages.
-                You accurately extract article titles, body content, and key information to provide 
-                necessary data for subsequent AI Agents' article summarization, translation, and satirical writing tasks.
-                You exclude advertisements and unnecessary content, focusing only on pure article content.
-                You specialize in identifying important facts and background information from Korean-language articles."""
+                """You are an expert at extracting key information from Korean web pages with advanced content validation.
+                You have extensive experience dealing with problematic Korean news sites that generate repetitive content,
+                infinite character loops, navigation menus, and other extraction issues.
+                
+                Your core specialties:
+                - Immediately detecting and stopping infinite character repetition (especially 가, 나, 다, etc.)
+                - Filtering out website interface elements, ads, and navigation content
+                - Extracting only meaningful Korean news article content
+                - Applying strict quality validation to prevent system failures
+                - Working efficiently under time constraints with timeout controls
+                
+                You NEVER allow repetitive content to pass through your validation.
+                You prioritize system stability over content completeness.
+                If content shows signs of being corrupted, repetitive, or non-newsworthy, you immediately skip it.
+                You are trained to recognize the specific patterns of Korean news website extraction failures."""
             ),
             tools=[self.scrape_tool],
             verbose=True,
@@ -77,6 +132,20 @@ class MemeAgentCrew:
             ),
             verbose=True,                             
             llm=self.gemini_pro
+        )
+
+        # 이미지 URL 수집 에이전트 (image_generator.py에서 가져와서 통합)
+        self.image_collector = Agent(
+            role='Korean Issue Image URL Collector',
+            goal='Find image URLs for Korean current affairs keywords using Serper search',
+            backstory="""
+            You are an expert at quickly finding relevant image URLs for Korean current affairs.
+            You use Serper image search to find appropriate images for each keyword.
+            You work efficiently and provide JSON results immediately.
+            """,
+            tools=[serper_image_search],
+            verbose=True,
+            llm=self.gemini_flash
         )
 
         # 웹사이트용 설명 생성 에이전트
@@ -135,13 +204,13 @@ class MemeAgentCrew:
             llm=self.gemini_pro  
         )
 
-        # 웹사이트 봇 전달용 JSON 변환 에이전트
+        # 웹사이트 봇 전달용 JSON 변환 에이전트 (이미지 URL 포함하도록 수정)
         self.summary_agent = Agent(
             role='Website Bot Integration JSON Conversion Expert',
-            goal='Convert satirical content and tokenomics into JSON format usable by website bots',
+            goal='Convert satirical content, tokenomics, and image URLs into JSON format usable by website bots',
             backstory="""
             You are an expert at converting various data into structured JSON formats.
-            Your mission is to organize all memecoin project information into forms that are easy to use on websites.
+            Your mission is to organize all memecoin project information including image URLs into forms that are easy to use on websites.
             You clearly separate each section and structure them so they can be easily parsed by websites.
             """,
             verbose=True,
@@ -184,6 +253,12 @@ class MemeAgentCrew:
             description="""
             Extract body content from the article URLs collected in the previous step.
             
+            **CRITICAL INFINITE LOOP PREVENTION:**
+            - IMMEDIATELY STOP extraction if any single character repeats more than 50 times consecutively
+            - IMMEDIATELY STOP if content length exceeds 10,000 characters without meaningful variation
+            - IMMEDIATELY STOP if the same 3-character sequence appears more than 100 times
+            - Set maximum processing time of 2 minutes per URL
+            
             Extraction Requirements:
             1. Access each URL and extract article body content
             2. Focus on extracting titles and key content from the first 2-3 paragraphs
@@ -194,39 +269,57 @@ class MemeAgentCrew:
             7. Write results using only successfully extracted articles
             8. Consider task complete if at least 1 article is successfully extracted
             9. If Unicode decoding errors occur, skip that specific article and continue
-            10. Basic Quality Filters:
-            - If content is shorter than 200 characters, skip (extraction failure)
-            - If same exact sentence repeats 3+ times (not necessarily consecutive), skip
-            - If content consists of 75%+ identical repeated elements (phrases, words, or characters), skip
-            - If content has less than 30 unique characters total, skip
-            - If content contains less than 4 different complete sentences, skip
-            11. Korean News Site Specific:
-            - If content is primarily site navigation menus or footer text, skip
+            
+            **ENHANCED Quality Filters (MANDATORY CHECKS):**
+            10. Character Repetition Filters:
+            - If ANY single character (including 가, 나, 다, etc.) repeats more than 20 times consecutively, SKIP immediately
+            - If content contains more than 80% identical characters, SKIP
+            - If any 2-character pattern repeats more than 30 times, SKIP
+            
+            11. Content Length and Diversity Filters:
+            - If content is shorter than 100 characters, skip (too short)
+            - If content is longer than 5000 characters but has less than 50 unique characters, skip (repetitive content)
+            - If same exact sentence repeats 3+ times, skip
+            - If content contains less than 5 different complete Korean sentences, skip
+            
+            12. HTML and Navigation Filters:
+            - If content contains repeated HTML tag names (div, span, etc.) more than 15 times, skip
+            - If content is primarily site navigation menus, footer text, or ads, skip
+            - If content contains more than 30% non-Korean characters (excluding spaces and punctuation), skip
+            
+            13. Korean News Site Specific:
             - Focus on extracting content within article body tags, not header/sidebar elements
-            12. If content contains repeated HTML tag names (div, span, etc.) more than 10 times, skip
-
-            # 11번, 12번 모두 추출 에이전트 단계에서 발생하는 무한루프 문제, 한국 기사 스크래핑 때 자주 발생하는 특유의 문제들을 해결하기 위해 추가한 요구사항입니다.
-
-            Error Handling:
+            - Skip if content is primarily login prompts, subscription messages, or error pages
+            - Skip if content contains more cookie/privacy policy text than actual news
+            
+            **Error Handling:**
+            - Set timeout of 120 seconds per article extraction
             - Exclude only the specific article for URL access failures, scraping blocks, etc.
             - Log failed articles but do not stop the entire operation
-            - Compose extracted_content array only with extractable articles
+            - If more than 80% of articles fail extraction, report extraction system failure
+            - Compose extracted_content array only with successfully extracted and validated articles
+            
+            **Output Validation:**
+            - Each extracted article must have at least 100 characters of meaningful Korean content
+            - Each article must contain at least 3 different Korean sentences
+            - Content must be primarily Korean language news content, not website interface elements
             
             Organize results in the following format:
             {{
                 "extracted_content": [
                     {{
                         "title": "Article Title",
-                        "url": "Article URL",
-                        "content": "Extracted Key Body Content",
+                        "url": "Article URL", 
+                        "content": "Extracted Key Body Content (validated Korean news content only)",
                         "key_points": ["Key Point 1", "Key Point 2", "Key Point 3"],
                         "background": "Issue Background",
-                        "source": "Media Outlet Name"
+                        "source": "Media Outlet Name",
+                        "content_length": "Length of extracted content for validation"
                     }}
                 ]
             }}
             """,
-            expected_output="Extracted article body content in JSON format",
+            expected_output="Extracted and validated article body content in JSON format",
             agent=self.extractor_agent
         )
     
@@ -285,6 +378,14 @@ class MemeAgentCrew:
             """,
             expected_output="Korean issue comprehensive summary translated into English",
             agent=self.translator_agent
+        )
+
+    # 이미지 URL 수집 태스크들 (image_generator.py에서 가져와서 적용)
+    def create_image_search_task(self, keyword):
+        return Task(
+            description=f"Use 'Serper Image Search' tool to find one image URL for the keyword: '{keyword}'",
+            expected_output="JSON string containing keyword and image_url",
+            agent=self.image_collector
         )
 
     def create_description_task(self):
@@ -426,7 +527,7 @@ class MemeAgentCrew:
     def create_summary_task(self):
         return Task(
             description="""
-            Extract appropriate information from all data generated in previous steps (article summaries, satirical content, etc.) that matches the JSON structure requirements below, and convert it into JSON format usable by website bots.
+            Extract appropriate information from all data generated in previous steps (article summaries, satirical content, image URLs, etc.) that matches the JSON structure requirements below, and convert it into JSON format usable by website bots.
             
             JSON Structure Requirements:
             {
@@ -448,9 +549,12 @@ class MemeAgentCrew:
                     }
                 ],
                 "hashtags": ["Hashtag1", "Hashtag2", "Hashtag3"],
+                "image_urls": {
+                    "keyword1": "Image URL for keyword 1",
+                    "keyword2": "Image URL for keyword 2", 
+                    "keyword3": "Image URL for keyword 3"
+                }
             }
-
-            JSON Structure Example:
 
             Guidelines:
             1. Keep all text in English
@@ -458,7 +562,8 @@ class MemeAgentCrew:
             3. Maintain special characters and emojis but ensure they don't break JSON structure
             4. Accurately classify and place content in each section
             5. For the "description" field, use the 3-4 sentence summary from the description_task result as is
-            6. OUTPUT ONLY THE JSON - NO EXPLANATORY TEXT BEFORE OR AFTER
+            6. Include image URLs collected from the image search tasks in the "image_urls" section
+            7. OUTPUT ONLY THE JSON - NO EXPLANATORY TEXT BEFORE OR AFTER
             """,
             expected_output="Pure JSON data with no additional text or explanations",
             agent=self.summary_agent
@@ -478,6 +583,12 @@ class MemeAgentCrew:
         translation_task = self.create_translation_task()
         translation_task.context = [extraction_task]
 
+        # 키워드 추출 후 이미지 검색 태스크들 생성
+        print("키워드 추출을 위한 임시 번역 실행...")
+        
+        # 이미지 검색을 위한 키워드는 번역 작업이 완료된 후 동적으로 생성해야 함
+        # 따라서 여기서는 placeholder로 생성하고 실제 실행 시에 키워드를 추출
+        
         description_task = self.create_description_task()
         description_task.context = [translation_task]
 
@@ -488,37 +599,61 @@ class MemeAgentCrew:
         tokenomics_task.context = [satire_task]
         
         summary_task = self.create_summary_task()
-        summary_task.context = [translation_task, description_task, tokenomics_task]
-
-        # 2. Crew를 생성하고 모든 Task를 순서대로 실행합니다.
-        crew = Crew(
-            agents=[self.search_agent, self.extractor_agent, self.translator_agent, self.description_agent, self.writer_agent, self.tokenomics_agent, self.summary_agent],
-            tasks=[search_task, extraction_task, translation_task, description_task, satire_task, tokenomics_task, summary_task],
+        
+        # 2. 첫 번째 단계: 번역까지만 실행해서 키워드를 추출
+        initial_crew = Crew(
+            agents=[self.search_agent, self.extractor_agent, self.translator_agent],
+            tasks=[search_task, extraction_task, translation_task],
             process=Process.sequential,
             verbose=True
         )
         
         try:
-            # kickoff()는 모든 작업을 실행시키는 역할만 합니다. 최종 결과물은 아래에서 직접 추출합니다.
-            crew.kickoff(inputs={"keyword": keyword, "why_trending": why_trending})
+            # 첫 번째 단계 실행
+            initial_crew.kickoff(inputs={"keyword": keyword, "why_trending": why_trending})
             
-            # 3. 실행 완료 후, 필요한 결과물을 각 Task 객체에서 직접 추출합니다.
-            # .output.raw를 사용하면 순수한 텍스트 결과물을 얻을 수 있습니다.
+            # 번역 결과에서 키워드 추출
             translation_result = translation_task.output.raw
+            keywords = extract_keywords_from_translation(translation_result)
+            print(f"추출된 키워드: {keywords}")
+            
+            # 키워드별 이미지 검색 태스크 생성
+            image_search_tasks = [self.create_image_search_task(kw) for kw in keywords]
+            
+            # 이미지 검색 태스크들을 요약 태스크의 context에 추가
+            summary_task.context = [translation_task, description_task, tokenomics_task] + image_search_tasks
+            
+            # 3. 두 번째 단계: 나머지 태스크들 실행
+            remaining_crew = Crew(
+                agents=[self.image_collector, self.description_agent, self.writer_agent, self.tokenomics_agent, self.summary_agent],
+                tasks=image_search_tasks + [description_task, satire_task, tokenomics_task, summary_task],
+                process=Process.sequential,
+                verbose=True
+            )
+            
+            remaining_crew.kickoff(inputs={"keywords": keywords, "translation_result": translation_result})
+            
+            # 4. 실행 완료 후, 필요한 결과물을 각 Task 객체에서 직접 추출합니다.
             description_result = description_task.output.raw
             satire_result = satire_task.output.raw
             tokenomics_result = tokenomics_task.output.raw
             summary_json = summary_task.output.raw
             
-            # 4. 요구사항에 맞게 파일을 저장하고 데이터를 전달합니다.
-            # 요구사항: 3번 에이전트의 결과물(풍자글)만 별도로 저장합니다.
-            # 이것이 실제 런치패드에 올릴 '밈코인 설명'이 됩니다.
+            # 이미지 검색 결과 추출
+            image_results = {}
+            for i, (task, keyword) in enumerate(zip(image_search_tasks, keywords)):
+                try:
+                    if task.output:
+                        output_text = task.output.raw if hasattr(task.output, 'raw') else str(task.output)
+                        parsed_data = json.loads(output_text)
+                        image_results[f"keyword{i+1}"] = parsed_data.get("image_url", f"no_result_{i+1}")
+                except Exception as e:
+                    print(f"이미지 검색 결과 파싱 실패 ({keyword}): {e}")
+                    image_results[f"keyword{i+1}"] = f"parse_error_{i+1}"
             
-            # 출력 디렉토리 생성
+            # 5. 파일 저장
             os.makedirs("./outputs", exist_ok=True)
-            
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
             
             translation_filename = f"./outputs/korean_issue_summary_{keyword}_{timestamp}.txt"
             with open(translation_filename, "w", encoding="utf-8") as f:
@@ -533,22 +668,26 @@ class MemeAgentCrew:
             satire_filename = f"./outputs/launchpad_description_{keyword}_{timestamp}.txt"
             with open(satire_filename, "w", encoding="utf-8") as f:
                 f.write(satire_result)
-            print(f"\n✅ 런치패드용 설명 파일 저장 완료: '{satire_filename}'")
-        
-            # (선택) 만약 전체 리포트(풍자글 + 토크노믹스)도 저장하고 싶다면 아래 주석을 해제하세요.
-            # full_report_filename = f"./outputs/full_report_{keyword}_{timestamp}.txt"
-            # with open(full_report_filename, "w", encoding="utf-8") as f:
-            #     f.write(f"{satire_result}\n\n{tokenomics_result}")
-            # print(f"✅ 전체 리포트 파일 저장 완료: '{full_report_filename}'")
+            print(f"✅ 런치패드용 설명 파일 저장 완료: '{satire_filename}'")
+
+            # 이미지 URL 결과도 별도로 저장
+            image_results_filename = f"./outputs/image_urls_{keyword}_{timestamp}.json"
+            with open(image_results_filename, "w", encoding="utf-8") as f:
+                json.dump({
+                    "keywords": keywords,
+                    "image_urls": image_results
+                }, f, indent=2, ensure_ascii=False)
+            print(f"✅ 이미지 URL 결과 저장 완료: '{image_results_filename}'")
             
-            # 5번 에이전트의 결과물(JSON)은 파일로 저장하지 않고,
-            # 웹사이트 봇에게 전달하기 위해 함수의 최종 결과로 반환합니다.
             print(f"✅ 웹사이트 봇에게 전달할 JSON 데이터 생성 완료.")
             
             return {
                 'json_data': summary_json,
                 'satire_filename': satire_filename,
-                'satire_content': satire_result
+                'satire_content': satire_result,
+                'image_urls': image_results,
+                'keywords': keywords,
+                'translation_result': translation_result
             }
             
         except Exception as e:
@@ -563,7 +702,6 @@ class MemeAgentCrew:
     def _get_partial_results(self, tasks):
         """에러 발생 시 부분적으로라도 완성된 결과를 반환"""
         results = {}
-
         
         # 각 task의 output이 있는지 확인
         task_names = ['search', 'extraction', 'translation', 'description', 'satire', 'tokenomics', 'summary']
@@ -611,6 +749,9 @@ def generate_satire_for_team(input_data: dict) -> dict:
             'json_data': str,           # 웹사이트 봇용 JSON
             'satire_filename': str,     # 저장된 풍자글 파일 경로
             'satire_content': str,      # 풍자글 내용
+            'image_urls': dict,         # 이미지 URL들
+            'keywords': list,           # 추출된 키워드들
+            'translation_result': str,  # 번역 결과
             'partial': bool             # 부분 완성 여부 (optional)
         }
     """
@@ -628,14 +769,73 @@ def generate_satire_for_team(input_data: dict) -> dict:
     except Exception as e:
         return {"error": f"풍자글 생성 중 오류 발생: {str(e)}"}
 
+# image_generator.py와 호환성을 위한 함수
+def generate_image_for_team(input_data: dict) -> dict:
+    """
+    image_generator.py의 generate_image_for_team 함수와 호환성 제공
+    이제 main.py에서 이미지 URL 수집까지 통합되어 처리됨
+    
+    Args:
+        input_data (dict): main.py의 결과 또는 관련 데이터
+        
+    Returns:
+        dict: 이미지 URL과 관련 결과
+    """
+    try:
+        # main.py 결과에서 이미지 관련 데이터 추출
+        if isinstance(input_data, dict):
+            if 'image_urls' in input_data and 'keywords' in input_data:
+                # 이미 main.py에서 처리된 경우
+                return {
+                    'success': True,
+                    'keywords': input_data['keywords'],
+                    'result': {
+                        'imgurl': input_data['image_urls'],
+                        'prompt': "Image prompt generation is now integrated with main satirical content generation."
+                    },
+                    'note': 'Image URLs are now collected as part of the main satirical content generation process.'
+                }
+            elif 'translation_result' in input_data:
+                # 번역 결과만 있는 경우, 키워드 추출해서 이미지 검색
+                translation_content = input_data['translation_result']
+                keywords = extract_keywords_from_translation(translation_content)
+                
+                # 각 키워드에 대해 이미지 검색 수행
+                image_results = {}
+                for i, keyword in enumerate(keywords):
+                    try:
+                        search_result = serper_image_search(keyword)
+                        parsed_result = json.loads(search_result)
+                        image_results[f"keyword{i+1}"] = parsed_result.get("image_url", f"no_result_{i+1}")
+                    except Exception as e:
+                        print(f"이미지 검색 실패 ({keyword}): {e}")
+                        image_results[f"keyword{i+1}"] = f"search_error_{i+1}"
+                
+                return {
+                    'success': True,
+                    'keywords': keywords,
+                    'result': {
+                        'imgurl': image_results,
+                        'prompt': "Image URLs collected for translated content keywords."
+                    }
+                }
+        
+        return {"success": False, "error": "올바른 입력 데이터가 제공되지 않았습니다."}
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'error': f'이미지 생성 실패: {str(e)}'
+        }
+
 # 메인 실행 함수
 def main():
     """테스트용 메인 함수"""
     meme_crew = MemeAgentCrew()
     
     # 팀원 에이전트로부터 받은 입력 예시
-    keyword = "임영웅 콘서트"
-    why_trending = "Singer Lim Young-woong's concert tour is trending as his upcoming shows in Incheon are expected to sell out rapidly due to high demand. Fans are eagerly preparing for what promises to be an emotional performance during his nationwide tour."
+    keyword = "정동원"
+    why_trending = "Prosecutors are investigating him on charges of driving without a license despite him being a high school student in 2023."
     
     result = meme_crew.run_satire_generation(keyword, why_trending)
     
@@ -645,6 +845,8 @@ def main():
         print("="*50)
         
         print("📄 저장된 파일:", result.get('satire_filename'))
+        print("🖼️ 이미지 URL들:", result.get('image_urls'))
+        print("🔑 추출된 키워드들:", result.get('keywords'))
         print("🌐 웹사이트 봇 전달용 JSON:")
         print(result.get('json_data'))
         
@@ -674,7 +876,9 @@ def quick_test():
     else:
         print(f"✅ 성공!")
         print(f"📄 파일: {result.get('satire_filename')}")
-        print(f"🌐 JSON 데이터: {result.get('json_data')[:200]}..." if result.get('json_data') else "JSON 없음")
+        print(f"🖼️ 이미지 URL들: {result.get('image_urls')}")
+        print(f"🔑 키워드들: {result.get('keywords')}")
+        print(f"🌐 JSON 데이터: {result.get('json_data')[:200] if result.get('json_data') else 'JSON 없음'}...")
 
 if __name__ == "__main__":
     # 실행 방법 선택
