@@ -134,8 +134,8 @@ class MemeAgentCrew:
             llm=self.gemini_pro
         )
 
-        # 이미지 URL 수집 에이전트 (image_generator.py에서 가져와서 통합)
-        self.image_collector = Agent(
+        # 이미지 URL 수집 에이전트 
+        self.collector_agent = Agent(
             role='Korean Issue Image URL Collector',
             goal='Find image URLs for Korean current affairs keywords using Serper search',
             backstory="""
@@ -385,7 +385,7 @@ class MemeAgentCrew:
         return Task(
             description=f"Use 'Serper Image Search' tool to find one image URL for the keyword: '{keyword}'",
             expected_output="JSON string containing keyword and image_url",
-            agent=self.image_collector
+            agent=self.collector_agent
         )
 
     def create_description_task(self):
@@ -625,7 +625,7 @@ class MemeAgentCrew:
             
             # 3. 두 번째 단계: 나머지 태스크들 실행
             remaining_crew = Crew(
-                agents=[self.image_collector, self.description_agent, self.writer_agent, self.tokenomics_agent, self.summary_agent],
+                agents=[self.collector_agent, self.description_agent, self.writer_agent, self.tokenomics_agent, self.summary_agent],
                 tasks=image_search_tasks + [description_task, satire_task, tokenomics_task, summary_task],
                 process=Process.sequential,
                 verbose=True
